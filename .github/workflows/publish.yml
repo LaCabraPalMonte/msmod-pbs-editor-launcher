@@ -1,0 +1,205 @@
+# Drop this file into your mod repo at `.github/workflows/publish.yml`.
+#
+# What it does:
+#   1. Triggers when you push a tag like `v1.2.3`.
+#   2. Reads `manifest.json#version`, refuses to continue if it doesn't match the tag.
+#   3. Zips your mod folder as `<modId>-<version>.zip`.
+#   4. Computes the SHA-256 of that zip.
+#   5. Creates the GitHub Release (or updates one already created for that tag)
+#      and uploads the zip + a `SHA256SUMS.txt` file as assets.
+#   6. Prints the exact `index.json` block you need to PR to
+#      https://github.com/Toskan4134/maker-studio-mods to update your registry entry.
+#
+# Required repo secrets / settings: none. The default `GITHUB_TOKEN` is enough to publish
+# releases on your own repo.
+#
+# Optional automation: see the commented `registry-pr` job at the bottom — it will open the
+# registry PR for you automatically (adding your entry the first time, bumping it after that)
+# if you set a `REGISTRY_PAT` secret (Personal Access Token with `repo` scope) and adjust
+# `FORK_OWNER` to your GitHub handle.
+
+name: Publish mod release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    outputs:
+      mod-id: ${{ steps.meta.outputs.mod-id }}
+      version: ${{ steps.meta.outputs.version }}
+      asset-name: ${{ steps.meta.outputs.asset-name }}
+      authors: ${{ steps.meta.outputs.authors }}
+      sha256: ${{ steps.hash.outputs.sha256 }}
+      entry: ${{ steps.hash.outputs.entry }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Read manifest + validate tag
+        id: meta
+        run: |
+          MOD_ID=$(jq -r '.id' manifest.json)
+          MANIFEST_VER=$(jq -r '.version' manifest.json)
+          TAG="${GITHUB_REF_NAME}"
+          TAG_VER="${TAG#v}"
+          if [ "$MANIFEST_VER" != "$TAG_VER" ]; then
+            echo "::error::manifest.json#version ($MANIFEST_VER) does not match tag ($TAG_VER)"
+            exit 1
+          fi
+          ASSET="${MOD_ID}-${MANIFEST_VER}.zip"
+          # Normalize whatever the manifest uses — `authors: [{name, url?}]`, `authors: ["name"]`
+          # or a plain `author: "name"` — into the one-line array index.json#authors expects.
+          AUTHORS=$(jq -c '[ (.authors // [.author])[] | select(. != null)
+                             | if type == "string" then {name: .} else . end ]' manifest.json)
+          if [ "$AUTHORS" = "[]" ]; then
+            echo '::error::manifest.json needs an author: either "author": "you" or "authors": [{"name": "you"}]'
+            exit 1
+          fi
+          echo "mod-id=$MOD_ID" >> "$GITHUB_OUTPUT"
+          echo "version=$MANIFEST_VER" >> "$GITHUB_OUTPUT"
+          echo "asset-name=$ASSET" >> "$GITHUB_OUTPUT"
+          echo "authors=$AUTHORS" >> "$GITHUB_OUTPUT"
+
+      - name: Build zip
+        run: |
+          # Zip everything in the repo root EXCEPT git, CI, and dev-only files.
+          # The Maker Studio installer expects `manifest.json` at the zip root.
+          zip -r "${{ steps.meta.outputs.asset-name }}" . \
+            -x ".git/*" \
+            -x ".github/*" \
+            -x ".gitignore" \
+            -x "*.zip"
+
+      - name: Compute SHA-256
+        id: hash
+        run: |
+          SHA=$(sha256sum "${{ steps.meta.outputs.asset-name }}" | awk '{print $1}')
+          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
+          echo "$SHA  ${{ steps.meta.outputs.asset-name }}" > SHA256SUMS.txt
+          # Whole registry entry, in index.json field order, for the registry-pr job below.
+          # Tags are slugged to the registry's `^[a-z0-9-]+$` (so "Terrain Tags" and "19.1"
+          # become "terrain-tags" and "19-1"), deduped, capped at the 8 the schema allows.
+          ENTRY=$(jq -c --argjson authors '${{ steps.meta.outputs.authors }}' \
+                        --arg repo "$GITHUB_REPOSITORY" \
+                        --arg asset "${{ steps.meta.outputs.asset-name }}" \
+                        --arg sha "$SHA" \
+                        '{ id, name, authors: $authors, repo: $repo,
+                           version, assetName: $asset, sha256: $sha,
+                           description,
+                           tags: ([ (.tags // [])[] | select(type == "string") | ascii_downcase
+                                    | gsub("[àáâãäå]";"a";"i") | gsub("[èéêë]";"e";"i")
+                                    | gsub("[ìíîï]";"i";"i")   | gsub("[òóôõö]";"o";"i")
+                                    | gsub("[ùúûü]";"u";"i")   | gsub("ñ";"n";"i") | gsub("ç";"c";"i")
+                                    | gsub("[^a-z0-9]+"; "-") | gsub("^-+|-+$"; "") | .[0:24]
+                                    | select(length > 0) ]
+                                  | reduce .[] as $t ([]; if any(.[]; . == $t) then . else . + [$t] end)
+                                  | .[0:8]),
+                           homepage: (.homepage // "https://github.com/\($repo)"),
+                           apiVersion, permissions }
+                         | with_entries(select(.value != null and .value != []))' manifest.json)
+          echo "entry=$ENTRY" >> "$GITHUB_OUTPUT"
+
+      - name: Publish release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          files: |
+            ${{ steps.meta.outputs.asset-name }}
+            SHA256SUMS.txt
+          fail_on_unmatched_files: true
+
+      - name: Print registry PR block
+        run: |
+          UPDATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          cat <<EOF
+          ====================================================================
+          Update https://github.com/Toskan4134/maker-studio-mods/blob/main/index.json
+          Top-level field:
+
+            "updatedAt": "$UPDATED_AT",
+
+          Your mod entry:
+
+            "authors": ${{ steps.meta.outputs.authors }},
+            "version": "${{ steps.meta.outputs.version }}",
+            "assetName": "${{ steps.meta.outputs.asset-name }}",
+            "sha256": "${{ steps.hash.outputs.sha256 }}"
+
+          Open a PR with that change. Until the PR is merged, users still install
+          the previously approved version.
+          ====================================================================
+          EOF
+
+  # ----------------------------------------------------------------------------------
+  # OPTIONAL: auto-open the registry PR for this release — it adds your mod's entry the first
+  # time and bumps it on every release after that. A maintainer still reviews and merges it.
+  #
+  # Enable by:
+  #   1. Forking https://github.com/Toskan4134/maker-studio-mods under your GitHub account.
+  #   2. Creating a PAT with `repo` scope on that account.
+  #   3. Adding it as a repo secret named REGISTRY_PAT.
+  #   4. Uncommenting this job and setting `FORK_OWNER` to your GitHub handle.
+  # ----------------------------------------------------------------------------------
+  #
+  # registry-pr:
+  #   needs: build-and-release
+  #   runs-on: ubuntu-latest
+  #   env:
+  #     FORK_OWNER: your-github-handle
+  #   steps:
+  #     # Check out the registry itself, not your fork: create-pull-request reads the base repo
+  #     # from this checkout and pushes the branch to `push-to-fork`. Checking out the fork here
+  #     # opens the PR fork -> fork, which never reaches the registry.
+  #     - name: Checkout registry
+  #       uses: actions/checkout@v5
+  #       with:
+  #         repository: Toskan4134/maker-studio-mods
+  #         token: ${{ secrets.REGISTRY_PAT }}
+  #         path: registry
+  #
+  #     - name: Update index.json
+  #       id: registry
+  #       working-directory: registry
+  #       run: |
+  #         MOD_ID="${{ needs.build-and-release.outputs.mod-id }}"
+  #         ENTRY='${{ needs.build-and-release.outputs.entry }}'
+  #         UPDATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  #         if jq -e --arg id "$MOD_ID" 'any(.mods[]; .id == $id)' index.json > /dev/null; then
+  #           echo "action=bump" >> "$GITHUB_OUTPUT"
+  #         else
+  #           echo "action=add" >> "$GITHUB_OUTPUT"
+  #         fi
+  #         # New mod: append the whole entry. Already listed: touch only the release fields, so
+  #         # anything the maintainer curated (description, tags, verified) survives the bump.
+  #         jq --argjson e "$ENTRY" --arg t "$UPDATED_AT" '
+  #           .updatedAt = $t
+  #           | if any(.mods[]; .id == $e.id)
+  #             then .mods |= map(if .id == $e.id
+  #                               then .version = $e.version | .assetName = $e.assetName
+  #                                  | .sha256 = $e.sha256 | .authors = $e.authors
+  #                               else . end)
+  #             else .mods += [$e]
+  #             end' index.json > index.json.tmp && mv index.json.tmp index.json
+  #
+  #     - name: Create PR
+  #       uses: peter-evans/create-pull-request@v7
+  #       with:
+  #         path: registry
+  #         token: ${{ secrets.REGISTRY_PAT }}
+  #         push-to-fork: ${{ env.FORK_OWNER }}/maker-studio-mods
+  #         branch: ${{ steps.registry.outputs.action }}-${{ needs.build-and-release.outputs.mod-id }}-${{ needs.build-and-release.outputs.version }}
+  #         commit-message: "${{ steps.registry.outputs.action }} ${{ needs.build-and-release.outputs.mod-id }} v${{ needs.build-and-release.outputs.version }}"
+  #         title: "${{ steps.registry.outputs.action }} ${{ needs.build-and-release.outputs.mod-id }} v${{ needs.build-and-release.outputs.version }}"
+  #         body: |
+  #           Automated PR from `${{ github.repository }}` on release of v${{ needs.build-and-release.outputs.version }}.
+  #
+  #           - asset: `${{ needs.build-and-release.outputs.asset-name }}`
+  #           - sha256: `${{ needs.build-and-release.outputs.sha256 }}`

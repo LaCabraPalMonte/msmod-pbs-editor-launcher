@@ -1,0 +1,24 @@
+{
+  "id": "com.lacabrapalmonte.pbs-editor-launcher",
+  "name": "PBS Editor Launcher",
+  "version": "1.1.2",
+  "authors": [
+    {
+      "name": "LaCabraPalMonte",
+      "url": "https://github.com/LaCabraPalMonte/PBS-Editor"
+    }
+  ],
+  "description": "Opens LaCabraPalMonte's standalone PBS Editor desktop app on the current project (a separate Windows program, not the built-in PBS Editor mod). Offers its download page if you don't have it.",
+  "homepage": "https://lacabrapalmonte.github.io/PBS-Editor/",
+  "tags": [
+    "pbs",
+    "essentials",
+    "tools",
+    "launcher"
+  ],
+  "apiVersion": "1.0.0",
+  "main": "index.js",
+  "permissions": [
+    "ui.toasts"
+  ]
+}
